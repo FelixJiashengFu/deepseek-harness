@@ -8,5 +8,6 @@
     "url": "https://github.com/FelixJiashengFu"
   },
   "repository": "https://github.com/FelixJiashengFu/deepseek-harness",
+  "license": "MIT",
   "keywords": ["deepseek", "parallel", "agents", "worktree", "orchestration"]
 }

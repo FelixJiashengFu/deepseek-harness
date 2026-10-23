@@ -94,3 +94,7 @@ deno run -A --no-config test/plugin-smoke.ts <一个空的临时目录>
 ```
 
 这个测试会用 `--plugin-dir` 启动一个真实的 Claude Code 会话（跑在 DeepSeek 上），确认 harness 工具能加载，并确认 150 秒的 `wait` 不会被客户端的 MCP 超时打断。
+
+## 许可证
+
+[MIT](LICENSE)
