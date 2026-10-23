@@ -3,7 +3,7 @@
 export const IS_WIN = Deno.build.os === "windows";
 export const SEP = IS_WIN ? "\\" : "/";
 export const HOME = Deno.env.get("USERPROFILE") ?? Deno.env.get("HOME") ?? ".";
-export const DSH_HOME = Deno.env.get("DSH_HOME") ?? join(HOME, ".deepseek-harness");
+export const STATE_HOME = Deno.env.get("DS_WORKERS_HOME") ?? join(HOME, ".deepseek-harness");
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -38,7 +38,7 @@ export function log(...a: unknown[]) {
     Deno.stderr.writeSync(enc.encode(line));
   } catch { /* stderr closed */ }
   try {
-    Deno.writeTextFileSync(join(DSH_HOME, "server.log"), line, { append: true });
+    Deno.writeTextFileSync(join(STATE_HOME, "server.log"), line, { append: true });
   } catch { /* log dir missing */ }
 }
 
@@ -154,13 +154,13 @@ export function inScope(path: string, globs: string[]): boolean {
 }
 
 export function findClaude(): string {
-  const env = Deno.env.get("DSH_CLAUDE");
+  const env = Deno.env.get("DS_WORKERS_CLAUDE");
   if (env) return env;
   const name = IS_WIN ? "claude.exe" : "claude";
   const candidates = [join(HOME, ".local", "bin", name)];
   for (const dir of (Deno.env.get("PATH") ?? "").split(IS_WIN ? ";" : ":")) if (dir) candidates.push(join(dir, name));
   for (const c of candidates) if (exists(c)) return c;
-  throw new Error("Claude Code CLI not found. Install it (irm https://claude.ai/install.ps1 | iex) or set DSH_CLAUDE to claude.exe.");
+  throw new Error("Claude Code CLI not found. Install it (irm https://claude.ai/install.ps1 | iex) or set DS_WORKERS_CLAUDE to claude.exe.");
 }
 
 export function findBash(): string | null {
@@ -201,17 +201,65 @@ export async function deepseekKey(): Promise<string> {
 }
 
 const KEEP = new Set(["CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CONFIG_DIR"]);
+const DROP = ["CLAUDE", "ANTHROPIC", "OTEL_", "DSH_", "ELECTRON_"];
 
-// The parent's environment minus everything that would tie a child to the calling Claude session.
+// The parent's environment minus everything that would tie a child to the calling Claude or DSH session.
 export function cleanEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(Deno.env.toObject())) {
     const K = k.toUpperCase();
     if (KEEP.has(K)) out[k] = v;
-    else if (K.startsWith("CLAUDE") || K.startsWith("ANTHROPIC") || K.startsWith("OTEL_") || K === "DEEPSEEK_API_KEY") continue;
+    else if (DROP.some((p) => K.startsWith(p)) || K === "DEEPSEEK_API_KEY") continue;
     else out[k] = v;
   }
   return out;
+}
+
+// DeepSeek Harness (DSH) desktop install: dsh.cmd runs "DeepSeek Harness.exe" as Node on the CLI
+// inside app.asar, so workers launch that pair directly. DS_WORKERS_DSH may name the install folder
+// or, outside Windows, a `dsh` launcher.
+export interface DshLauncher {
+  cmd: string;
+  prefix: string[];
+  env: Record<string, string>;
+}
+
+export function findDsh(): DshLauncher | null {
+  const configured = Deno.env.get("DS_WORKERS_DSH");
+  if (IS_WIN) {
+    const dirs = [configured, join(Deno.env.get("LOCALAPPDATA") ?? join(HOME, "AppData", "Local"), "Programs", "DeepSeek Harness")];
+    for (const d of dirs) {
+      if (!d) continue;
+      const dir = d.toLowerCase().endsWith(".exe") ? join(d, "..") : d;
+      const exe = join(dir, "DeepSeek Harness.exe");
+      const cli = join(dir, "resources", "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh-desktop-host", "lib", "cli.js");
+      if (exists(exe) && exists(join(dir, "resources", "app.asar"))) return { cmd: exe, prefix: ["--expose-internals", cli], env: { ELECTRON_RUN_AS_NODE: "1" } };
+    }
+    return null;
+  }
+  const candidates = [configured, ...(Deno.env.get("PATH") ?? "").split(":").filter(Boolean).map((d) => join(d, "dsh"))];
+  for (const c of candidates) if (c && exists(c)) return { cmd: c, prefix: [], env: {} };
+  return null;
+}
+
+export type Engine = "dsh" | "claude";
+
+export function defaultEngine(): Engine {
+  const e = Deno.env.get("DS_WORKERS_ENGINE");
+  if (e === "dsh" || e === "claude") return e;
+  return findDsh() ? "dsh" : "claude";
+}
+
+// Model ids as each engine names them. DSH routes deepseek-official straight to DeepSeek's API.
+export function dshModelId(m?: string): string {
+  if (!m || m === "flash") return "deepseek-flash";
+  if (m === "pro") return "deepseek-v4-pro";
+  return m.replace(/\[1m\]$/, "");
+}
+
+// DSH's DeepSeek route accepts off | low | high | max.
+export function dshEffort(e: string): string {
+  return ({ low: "low", medium: "high", high: "high", xhigh: "max", max: "max" } as Record<string, string>)[e] ?? "max";
 }
 
 export const MODELS: Record<string, string> = { flash: "deepseek-flash[1m]", pro: "deepseek-v4-pro[1m]" };
@@ -224,7 +272,7 @@ export function modelId(m?: string): string {
 export function workerEnv(model: string, key: string): Record<string, string> {
   return {
     ...cleanEnv(),
-    ANTHROPIC_BASE_URL: Deno.env.get("DSH_BASE_URL") ?? "https://api.deepseek.com/anthropic",
+    ANTHROPIC_BASE_URL: Deno.env.get("DS_WORKERS_BASE_URL") ?? "https://api.deepseek.com/anthropic",
     ANTHROPIC_AUTH_TOKEN: key,
     ANTHROPIC_MODEL: model,
     ANTHROPIC_DEFAULT_OPUS_MODEL: model,

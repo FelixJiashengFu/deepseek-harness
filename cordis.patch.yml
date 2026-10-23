@@ -1,0 +1,8 @@
+# dsh-parallel-workers bundle patch: adds one host row. The row mounts DSH's MCP client on the
+# bundled harness server (tools mcp__harness__dispatch, wait, result, retry, integrate, land, ...)
+# and a skill provider for the `deliver` workflow skill. Configure it from the Plugins page or here:
+#   deno: C:\path\to\deno.exe        # when deno is not on PATH
+#   toolCallTimeoutMinutes: 62       # longest a harness tool call may block
+- insert:
+    - id: parallel-workers
+      name: dsh-parallel-workers

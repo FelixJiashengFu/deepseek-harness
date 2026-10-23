@@ -1,11 +1,13 @@
 // End-to-end test: builds a small Deno library with stubbed modules and tests, then drives the
 // harness MCP server like an orchestrator would: dispatch -> wait -> result -> integrate (with a
 // deliberate conflict) -> land (with a concurrent edit in the main tree) -> cleanup.
-// Usage: deno run -A --no-config test/e2e.ts <empty scratch dir>
+// Usage: deno run -A --no-config test/e2e.ts <empty scratch dir> [dsh|claude]
+// The optional engine picks the worker engine (default: dsh when DeepSeek Harness is installed).
 // It spends a little DeepSeek credit (five short workers).
 
 const base = Deno.args[0];
-if (!base) throw new Error("usage: e2e.ts <scratch dir>");
+const engine = Deno.args[1];
+if (!base) throw new Error("usage: e2e.ts <scratch dir> [dsh|claude]");
 const sep = Deno.build.os === "windows" ? "\\" : "/";
 const repo = `${base}${sep}demo`;
 const home = `${base}${sep}home`;
@@ -89,7 +91,7 @@ write("src/index.ts", `export * from "./stats.ts";\nexport * from "./text.ts";\n
 // ---- MCP client ----
 const child = new Deno.Command("deno", {
   args: ["run", "-A", "--no-config", "--quiet", server],
-  env: { DSH_HOME: home, DENO_NO_UPDATE_CHECK: "1" },
+  env: { DS_WORKERS_HOME: home, DENO_NO_UPDATE_CHECK: "1" },
   stdin: "piped",
   stdout: "piped",
   stderr: "inherit",
@@ -139,6 +141,7 @@ console.log("tools:", list.result.tools.map((t: any) => t.name).join(", "));
 const t0 = Date.now();
 const d = await tool("dispatch", {
   repo,
+  ...(engine ? { engine } : {}),
   maxParallel: 5,
   context: "Deno + TypeScript, no external imports. Keep the existing exported signatures. Run tests with: deno test --no-config <file>.",
   verify: "deno test --no-config tests/",

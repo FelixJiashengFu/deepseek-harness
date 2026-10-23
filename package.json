@@ -1,0 +1,45 @@
+{
+  "name": "dsh-parallel-workers",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness plugin: run DeepSeek-powered coding agents (DSH headless workers) in parallel git worktrees to deliver large, splittable tasks faster, then review, integrate and land their work.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib/",
+    "server/",
+    "skills/",
+    "locale/*.json",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "icon": "./icon.svg",
+  "license": "MIT",
+  "author": "Jiasheng Fu (https://github.com/FelixJiashengFu)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FelixJiashengFu/deepseek-harness.git"
+  },
+  "keywords": ["dsh", "deepseek-harness", "deepseek", "parallel", "agents", "worktree"],
+  "engines": {
+    "dsh": ">=0.2.0-rc.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-mcp-client": ">=0.2.0-rc.1",
+    "@deepseek-ai/dsh-skill-filesystem": ">=0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

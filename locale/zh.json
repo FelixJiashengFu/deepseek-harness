@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DeepSeek 并行工人 (dsh-parallel-workers)",
+    "description": "把可拆分的大任务分给多个 DeepSeek 工人（DSH headless 智能体）并行完成。每个工人在独立的 git worktree 里、在 DSH 的工作区沙箱内干活，完成后统一审核、集成、落地。需要 Deno 和 git。"
+  }
+}

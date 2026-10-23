@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Parallel DeepSeek workers (dsh-parallel-workers)",
+    "description": "Split a large task across several DeepSeek workers (DSH headless agents), each in its own git worktree inside DSH's workspace sandbox, then review, integrate and land their work. Needs Deno and git."
+  }
+}

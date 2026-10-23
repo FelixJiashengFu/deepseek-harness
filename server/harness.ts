@@ -1,17 +1,23 @@
-// Runs, tasks and the worker scheduler. Each task is one headless `claude -p` process on DeepSeek,
-// working in its own git worktree on branch dsh/<run>/<task>.
+// Runs, tasks and the worker scheduler. Each task is one headless agent process on DeepSeek, working
+// in its own git worktree on branch dsh/<run>/<task>: DeepSeek Harness's `dsh --profile headless`
+// (engine "dsh", the default when DSH is installed) or `claude -p` (engine "claude").
 
 import * as G from "./git.ts";
 import {
   cleanEnv,
   clip,
   deepseekKey,
-  DSH_HOME,
+  defaultEngine,
+  dshEffort,
+  dshModelId,
+  type Engine,
+  STATE_HOME,
   ensureDir,
   eolOf,
   exec,
   exists,
   findClaude,
+  findDsh,
   fmtMs,
   fmtTokens,
   inScope,
@@ -69,6 +75,7 @@ export interface Task {
   files: string[];
   verify?: string;
   context?: string;
+  engine: Engine;
   model: string;
   effort: string;
   maxTurns?: number;
@@ -123,18 +130,20 @@ export interface Run {
   integration?: Integration;
   landedSha?: string;
   cleaned?: boolean;
+  owner?: number; // pid of the harness server driving the run's workers
+  engine?: Engine;
 }
 
-const GLOBAL_MAX = Math.max(1, Number(Deno.env.get("DSH_MAX_PARALLEL") ?? 12));
-const VERIFY_TIMEOUT_MS = Number(Deno.env.get("DSH_VERIFY_TIMEOUT_MIN") ?? 15) * 60_000;
+const GLOBAL_MAX = Math.max(1, Number(Deno.env.get("DS_WORKERS_MAX_PARALLEL") ?? 12));
+const VERIFY_TIMEOUT_MS = Number(Deno.env.get("DS_WORKERS_VERIFY_TIMEOUT_MIN") ?? 15) * 60_000;
 const runs = new Map<string, Run>();
 const procs = new Map<string, Deno.ChildProcess>();
 const repoLocks = new Map<string, Mutex>();
 const listeners = new Set<() => void>();
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-const runDir = (id: string) => join(DSH_HOME, "runs", id);
-const wtDir = (id: string) => join(DSH_HOME, "wt", id);
+const runDir = (id: string) => join(STATE_HOME, "runs", id);
+const wtDir = (id: string) => join(STATE_HOME, "wt", id);
 
 function repoLock(repo: string): Mutex {
   const k = repo.toLowerCase();
@@ -161,23 +170,46 @@ function save(run: Run, now = false) {
   } else if (!saveTimers.has(run.id)) saveTimers.set(run.id, setTimeout(write, 1000));
 }
 
-export function loadRuns() {
-  ensureDir(join(DSH_HOME, "runs"));
-  for (const e of Deno.readDirSync(join(DSH_HOME, "runs"))) {
+// Several harness servers can share the state folder (Claude Code and DeepSeek Harness side by side).
+// A run whose owner server is still alive belongs to that server; this one leaves it alone.
+async function ownerAlive(pid: number | undefined): Promise<boolean> {
+  if (!pid || pid === Deno.pid) return false;
+  if (!IS_WIN) {
+    try {
+      Deno.kill(pid, "SIGCONT");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const r = await exec("tasklist", ["/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"]);
+  return new RegExp(`^"deno\\.exe","${pid}"`, "im").test(r.stdout);
+}
+
+// Returns false when the run is driven by another live harness server.
+async function adopt(run: Run): Promise<boolean> {
+  const active = run.tasks.some((t) => !TERMINAL.has(t.state));
+  if (active && (await ownerAlive(run.owner))) return false;
+  let changed = false;
+  for (const t of run.tasks) {
+    if (!TERMINAL.has(t.state)) {
+      t.state = "interrupted";
+      t.error = "The harness restarted while this task was queued or running. Use retry to continue it.";
+      t.pid = undefined;
+      changed = true;
+    }
+  }
+  runs.set(run.id, run);
+  if (changed) save(run, true);
+  return true;
+}
+
+export async function loadRuns() {
+  ensureDir(join(STATE_HOME, "runs"));
+  for (const e of Deno.readDirSync(join(STATE_HOME, "runs"))) {
     if (!e.isDirectory) continue;
     try {
-      const run = JSON.parse(Deno.readTextFileSync(join(runDir(e.name), "run.json"))) as Run;
-      let changed = false;
-      for (const t of run.tasks) {
-        if (!TERMINAL.has(t.state)) {
-          t.state = "interrupted";
-          t.error = "The harness restarted while this task was queued or running. Use retry to continue it.";
-          t.pid = undefined;
-          changed = true;
-        }
-      }
-      runs.set(run.id, run);
-      if (changed) save(run, true);
+      await adopt(JSON.parse(Deno.readTextFileSync(join(runDir(e.name), "run.json"))) as Run);
     } catch { /* not a run */ }
   }
 }
@@ -194,10 +226,19 @@ export async function shutdown() {
   }
 }
 
-function getRun(id: string): Run {
+async function getRun(id: string): Promise<Run> {
   const r = runs.get(id);
-  if (!r) throw new Error(`Unknown run ${id}. Call status without runId to list runs.`);
-  return r;
+  if (r) return r;
+  let disk: Run;
+  try {
+    disk = JSON.parse(Deno.readTextFileSync(join(runDir(id), "run.json")));
+  } catch {
+    throw new Error(`Unknown run ${id}. Call status without runId to list runs.`);
+  }
+  if (!(await adopt(disk))) {
+    throw new Error(`Run ${id} is being driven by another harness server (pid ${disk.owner}), for example in another app. Use it there, or wait until its tasks finish.`);
+  }
+  return disk;
 }
 
 function getTask(run: Run, id: string): Task {
@@ -247,9 +288,11 @@ function systemPrompt(run: Run, t: Task): string {
     `- Your scope: ${scope}. Change files outside it only when the task cannot be done otherwise, keep such changes minimal, and list them in your report.`,
     `- Do not commit, push, merge, rebase, switch branches, reset or stash. The harness commits your work when you finish.`,
     `- Nobody can answer questions while you work. When something is unclear, pick the most reasonable option, note the assumption, and keep going.`,
-    `- Shell commands outside the allowed list are denied automatically. If one is denied, use another way instead of retrying it.${links}`,
+    t.engine === "dsh"
+      ? `- A sandbox lets you write only inside this worktree and a private temp folder, and it blocks named pipes, so some test runners (for example \`deno test\`) crash inside it. Nobody can approve sandbox escalation, so do not request it. If a check cannot run in the sandbox, verify another way (type-check, run the code directly) and say so in your report.${links}`
+      : `- Shell commands outside the allowed list are denied automatically. If one is denied, use another way instead of retrying it.${links}`,
     t.verify
-      ? `- When you finish, the orchestrator runs \`${t.verify}\` in your worktree. Run it yourself first and fix what fails.`
+      ? `- When you finish, the orchestrator runs \`${t.verify}\` in your worktree${t.engine === "dsh" ? " outside the sandbox" : ""}. Run it yourself first and fix what fails.`
       : `- Check your work before finishing (run the project's tests or build when there are any).`,
     `- End with a short report: files changed, how you verified, assumptions, anything left undone.`,
   ].join("\n");
@@ -269,24 +312,30 @@ function describeTool(t: Task, name: string, input: Record<string, unknown>): st
     return s.toLowerCase().startsWith(t.worktree.toLowerCase()) ? s.slice(t.worktree.length + 1) : s;
   };
   if (input?.file_path) return `${name} ${rel(input.file_path)}`;
-  if (name === "Bash" && input?.command) {
+  if (input?.command) {
     // Show commands relative to the worktree: workers often cd into their absolute path first.
     let cmd = String(input.command);
     for (const p of [t.worktree, t.worktree.replace(/\\/g, "/")]) cmd = cmd.split(`"${p}"`).join(".").split(p).join(".");
-    return `Bash: ${cmd.replace(/\s+/g, " ").slice(0, 70)}`;
+    return `${name}: ${cmd.replace(/\s+/g, " ").slice(0, 70)}`;
   }
   if (input?.pattern) return `${name} ${String(input.pattern).slice(0, 60)}`;
   if (name === "Task" && input?.description) return `Task: ${String(input.description).slice(0, 60)}`;
   return name;
 }
 
-function onEvent(t: Task, a: Attempt, line: string) {
-  let e: Record<string, any>;
+function parseEvent(line: string): Record<string, any> | null {
   try {
-    e = JSON.parse(line);
+    const e = JSON.parse(line);
+    return e && typeof e === "object" ? e : null;
   } catch {
-    return;
+    return null; // stray log lines share stdout with the event stream
   }
+}
+
+// `claude -p --output-format stream-json`
+function onClaudeEvent(t: Task, a: Attempt, line: string) {
+  const e = parseEvent(line);
+  if (!e) return;
   t.progress.at = Date.now();
   if (e.type === "system" && e.subtype === "init") {
     t.sessionId = a.sessionId = e.session_id;
@@ -313,6 +362,39 @@ function onEvent(t: Task, a: Attempt, line: string) {
       cacheRead: e.usage?.cache_read_input_tokens ?? 0,
     };
     if (e.session_id) t.sessionId = a.sessionId = e.session_id;
+  }
+}
+
+// `dsh --profile headless --json`: session, status (turn/step phases with usage), thinking, text,
+// tool_call, tool_result, final, error.
+function onDshEvent(t: Task, a: Attempt, line: string) {
+  const e = parseEvent(line);
+  if (!e) return;
+  t.progress.at = Date.now();
+  if (e.type === "session") {
+    t.sessionId = a.sessionId = e.sessionId;
+  } else if (e.type === "status") {
+    if (e.phase === "step_start") a.turns = t.progress.turns = (a.turns ?? 0) + 1;
+    else if (e.phase === "step_end" && e.usage) {
+      const u = (a.usage ??= { input: 0, output: 0, cacheRead: 0 });
+      u.input += (e.usage.inputTokens ?? 0) + (e.usage.cacheReadTokens ?? 0) + (e.usage.cacheWriteTokens ?? 0);
+      u.output += e.usage.outputTokens ?? 0;
+      u.cacheRead += e.usage.cacheReadTokens ?? 0;
+    } else if (e.phase === "turn_end") {
+      a.subtype = e.reason?.kind ?? "unknown";
+      a.isError = a.subtype !== "completed";
+    }
+  } else if (e.type === "tool_call") {
+    t.progress.tools++;
+    t.progress.last = describeTool(t, e.tool, e.input ?? {});
+  } else if (e.type === "text" && e.text?.trim()) {
+    t.progress.lastText = e.text.trim().replace(/\s+/g, " ").slice(0, 160);
+  } else if (e.type === "final") {
+    a.resultText = e.text ?? "";
+  } else if (e.type === "error") {
+    a.isError = true;
+    a.subtype = e.code ?? "error";
+    a.resultText = e.message ?? JSON.stringify(e);
   }
 }
 
@@ -395,6 +477,57 @@ async function startTask(run: Run, t: Task) {
   }
 }
 
+interface Launch {
+  cmd: string;
+  args: string[];
+  env: Record<string, string>;
+  onLine: (line: string) => void;
+}
+
+function claudeLaunch(run: Run, t: Task, a: Attempt, key: string, resume: boolean): Launch {
+  const args = [
+    "-p", "--output-format", "stream-json", "--verbose",
+    "--permission-mode", run.permissionMode, "--permission-prompts", "none",
+    "--strict-mcp-config", "--setting-sources", "project,local",
+    "--effort", t.effort,
+    ...(t.maxTurns ? ["--max-turns", String(t.maxTurns)] : []),
+    ...(resume ? ["--resume", t.sessionId!] : []),
+    "--append-system-prompt", systemPrompt(run, t),
+    "--allowedTools", ...DEFAULT_ALLOWED, ...run.allowedTools,
+    "--disallowedTools", ...DEFAULT_DENIED,
+  ];
+  return { cmd: findClaude(), args, env: workerEnv(modelId(t.model), key), onLine: (l) => onClaudeEvent(t, a, l) };
+}
+
+// Each DSH worker gets its own DSH_HOME: an isolated session store, and an AGENTS.md there that
+// DSH injects as user-global instructions (the worker rules). A --patch overlay picks the model.
+function dshLaunch(run: Run, t: Task, a: Attempt, key: string, resume: boolean): Launch {
+  const dsh = findDsh();
+  if (!dsh) throw new Error("DeepSeek Harness (DSH) is not installed. Install it, set DS_WORKERS_DSH to its folder, or use engine \"claude\".");
+  const home = join(runDir(run.id), "dsh", t.id);
+  ensureDir(home);
+  Deno.writeTextFileSync(join(home, "AGENTS.md"), systemPrompt(run, t) + "\n");
+  const patch = join(home, "worker.patch.yml");
+  Deno.writeTextFileSync(patch, [
+    "- id: agent-default-model",
+    "  name: '@deepseek-ai/dsh-agent-default-model'",
+    "  config:",
+    "    provider: deepseek-official",
+    `    model: ${JSON.stringify(dshModelId(t.model))}`,
+    `    reasoningEffort: ${dshEffort(t.effort)}`,
+    "",
+  ].join("\n"));
+  const args = [...dsh.prefix, "--profile", "headless", "--patch", patch, "--json", ...(resume ? ["--session-id", t.sessionId!] : [])];
+  const env = {
+    ...cleanEnv(),
+    ...dsh.env,
+    DSH_HOME: home,
+    DEEPSEEK_API_KEY: key,
+    DSH_PERMISSION_MODE: run.permissionMode === "bypassPermissions" ? "danger-full-access" : "workspace-write",
+  };
+  return { cmd: dsh.cmd, args, env, onLine: (l) => onDshEvent(t, a, l) };
+}
+
 async function runWorker(run: Run, t: Task) {
   const key = await deepseekKey();
   const a: Attempt = { n: t.attempts.length + 1, startedAt: Date.now() };
@@ -405,22 +538,11 @@ async function runWorker(run: Run, t: Task) {
   t.resume = false;
   t.timedOut = false;
   t.progress = { turns: 0, tools: 0, at: Date.now() };
-  const allowed = [...DEFAULT_ALLOWED, ...run.allowedTools];
-  const args = [
-    "-p", "--output-format", "stream-json", "--verbose",
-    "--permission-mode", run.permissionMode, "--permission-prompts", "none",
-    "--strict-mcp-config", "--setting-sources", "project,local",
-    "--effort", t.effort,
-    ...(t.maxTurns ? ["--max-turns", String(t.maxTurns)] : []),
-    ...(resume ? ["--resume", t.sessionId!] : []),
-    "--append-system-prompt", systemPrompt(run, t),
-    "--allowedTools", ...allowed,
-    "--disallowedTools", ...DEFAULT_DENIED,
-  ];
-  const child = new Deno.Command(findClaude(), {
-    args,
+  const launch = t.engine === "dsh" ? dshLaunch(run, t, a, key, resume) : claudeLaunch(run, t, a, key, resume);
+  const child = new Deno.Command(launch.cmd, {
+    args: launch.args,
     cwd: t.worktree,
-    env: workerEnv(modelId(t.model), key),
+    env: launch.env,
     clearEnv: true,
     stdin: "piped",
     stdout: "piped",
@@ -452,11 +574,11 @@ async function runWorker(run: Run, t: Task) {
       buf += dec.decode(chunk, { stream: true });
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {
-        onEvent(t, a, buf.slice(0, i));
+        launch.onLine(buf.slice(0, i));
         buf = buf.slice(i + 1);
       }
     }
-    if (buf.trim()) onEvent(t, a, buf);
+    if (buf.trim()) launch.onLine(buf);
   })();
   const readErr = (async () => {
     for await (const chunk of child.stderr) await errFile.write(chunk);
@@ -561,7 +683,7 @@ export function statusText(run: Run, note = ""): string {
   const work = run.tasks.reduce((s, t) => s + taskTime(t), 0);
   const u = run.tasks.map(usageOf).reduce((x, y) => ({ input: x.input + y.input, output: x.output + y.output, cacheRead: x.cacheRead + y.cacheRead }), { input: 0, output: 0, cacheRead: 0 });
   const lines = [
-    `Run ${run.id} · ${run.repo} · base ${run.baseSha.slice(0, 8)} (${run.baseLabel})${run.cleaned ? " · cleaned up" : ""}`,
+    `Run ${run.id} · ${run.repo} · base ${run.baseSha.slice(0, 8)} (${run.baseLabel}) · ${run.engine === "dsh" ? "DSH" : "Claude Code"} workers${run.cleaned ? " · cleaned up" : ""}`,
     fmt(head),
     ...rows.map(fmt),
     `done ${count("done")} · running ${count("running") + count("preparing") + count("finishing")} · queued ${count("queued")} · failed ${count("failed") + count("timeout")} · cancelled ${count("cancelled")}` +
@@ -615,19 +737,20 @@ export interface DispatchInput {
   maxTurns?: number;
   allowedTools?: string[];
   permissionMode?: string;
+  engine?: string;
 }
 
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 export async function dispatch(a: DispatchInput): Promise<string> {
   if (!a.tasks?.length) throw new Error("tasks must list at least one task");
-  findClaude();
+  if (a.engine && a.engine !== "dsh" && a.engine !== "claude") throw new Error('engine must be "dsh" or "claude"');
   await deepseekKey();
   const repo = await G.repoRoot(a.repo);
   let run: Run;
   const warnings: string[] = [];
   if (a.runId) {
-    run = getRun(a.runId);
+    run = await getRun(a.runId);
     if (run.cleaned) throw new Error(`Run ${run.id} was cleaned up; start a new run.`);
     if (run.repo.toLowerCase() !== repo.toLowerCase()) throw new Error(`Run ${run.id} belongs to ${run.repo}, not ${repo}`);
   } else {
@@ -648,6 +771,14 @@ export async function dispatch(a: DispatchInput): Promise<string> {
   if (a.link) run.link = a.link.map((l) => l.replace(/[\\/]+$/, ""));
   if (a.allowedTools) run.allowedTools = a.allowedTools;
   if (a.maxParallel) run.maxParallel = Math.max(1, Math.min(GLOBAL_MAX, a.maxParallel));
+  const engine: Engine = (a.engine as Engine | undefined) ?? run.engine ?? defaultEngine();
+  if (engine === "dsh" && !findDsh()) throw new Error("DeepSeek Harness (DSH) is not installed here. Install it, set DS_WORKERS_DSH to its folder, or pass engine: \"claude\".");
+  if (engine === "claude") findClaude();
+  run.engine ??= engine;
+  if (engine === "dsh") {
+    if (a.maxTurns || a.tasks.some((s) => s.maxTurns)) warnings.push("maxTurns applies only to the claude engine; DSH workers ignore it (timeoutMin still applies).");
+    if (a.allowedTools?.length) warnings.push("allowedTools applies only to the claude engine; DSH workers are confined by its workspace-write sandbox instead.");
+  }
 
   const ids = new Set(run.tasks.map((t) => t.id));
   for (const s of a.tasks) {
@@ -708,6 +839,7 @@ export async function dispatch(a: DispatchInput): Promise<string> {
       files: s.files ?? [],
       verify: s.verify ?? run.verify,
       context: run.context,
+      engine,
       model: s.model ?? a.model ?? "flash",
       effort: s.effort ?? a.effort ?? "max",
       maxTurns: s.maxTurns ?? a.maxTurns,
@@ -720,12 +852,13 @@ export async function dispatch(a: DispatchInput): Promise<string> {
       progress: { turns: 0, tools: 0 },
     });
   }
+  run.owner = Deno.pid;
   runs.set(run.id, run);
   save(run, true);
   pump();
   const lines = [
     `${a.runId ? "Added" : "Started"} ${a.tasks.length} task(s) in run ${run.id}; up to ${run.maxParallel} run at once.`,
-    `Base: ${baseSha.slice(0, 8)} (${baseLabel}). Model: ${modelId(a.model)}. Worktrees: ${wtDir(run.id)}`,
+    `Base: ${baseSha.slice(0, 8)} (${baseLabel}). Workers: ${engine === "dsh" ? `DSH headless, ${dshModelId(a.model)}` : `Claude Code CLI, ${modelId(a.model)}`}. Worktrees: ${wtDir(run.id)}`,
     ...warnings.map((w) => `Warning: ${w}`),
     "",
     statusText(run),
@@ -739,7 +872,7 @@ export async function wait(
   a: { runId: string; taskIds?: string[]; mode?: string; timeoutSec?: number },
   progress?: (done: number, total: number, msg: string) => void,
 ): Promise<string> {
-  const run = getRun(a.runId);
+  const run = await getRun(a.runId);
   const tasks = a.taskIds?.length ? a.taskIds.map((id) => getTask(run, id)) : run.tasks;
   const mode = a.mode === "any" ? "any" : "all";
   const deadline = Date.now() + Math.max(1, Math.min(3600, a.timeoutSec ?? 240)) * 1000;
@@ -769,12 +902,12 @@ export async function wait(
   return statusText(run, note);
 }
 
-export function status(a: { runId?: string }): string {
-  return a.runId ? statusText(getRun(a.runId)) : listRunsText();
+export async function status(a: { runId?: string }): Promise<string> {
+  return a.runId ? statusText(await getRun(a.runId)) : listRunsText();
 }
 
-export function result(a: { runId: string; taskIds?: string[]; includeDiff?: boolean; maxDiffChars?: number }): string {
-  const run = getRun(a.runId);
+export async function result(a: { runId: string; taskIds?: string[]; includeDiff?: boolean; maxDiffChars?: number }): Promise<string> {
+  const run = await getRun(a.runId);
   const tasks = a.taskIds?.length ? a.taskIds.map((id) => getTask(run, id)) : run.tasks.filter((t) => TERMINAL.has(t.state));
   if (!tasks.length) return "No finished tasks yet.";
   const max = a.maxDiffChars ?? 12000;
@@ -785,7 +918,7 @@ export function result(a: { runId: string; taskIds?: string[]; includeDiff?: boo
     out.push(
       `## ${t.id} — ${t.state}${t.attempts.length ? ` (attempt ${t.attempts.length}, ${fmtMs(taskTime(t))}, ${last?.turns ?? t.progress.turns} turns, ${fmtTokens(u.input)} in / ${fmtTokens(u.output)} out)` : ""}`,
       `Title: ${t.title}`,
-      `Branch ${t.branch} · worktree ${t.worktree}${t.sessionId ? ` · session ${t.sessionId}` : ""}`,
+      `Branch ${t.branch} · worktree ${t.worktree}${t.sessionId ? ` · session ${t.sessionId}` : ""}${t.engine === "dsh" ? ` · DSH_HOME ${join(runDir(run.id), "dsh", t.id)}` : ""}`,
     );
     if (t.error) out.push(`Problem: ${t.error}`);
     if (!TERMINAL.has(t.state)) {
@@ -814,8 +947,8 @@ export function result(a: { runId: string; taskIds?: string[]; includeDiff?: boo
   return out.join("\n");
 }
 
-export function retry(a: { runId: string; taskId: string; feedback: string; fresh?: boolean; model?: string; effort?: string; timeoutMin?: number }): string {
-  const run = getRun(a.runId);
+export async function retry(a: { runId: string; taskId: string; feedback: string; fresh?: boolean; model?: string; effort?: string; timeoutMin?: number }): Promise<string> {
+  const run = await getRun(a.runId);
   const t = getTask(run, a.taskId);
   if (run.cleaned) throw new Error("This run was cleaned up.");
   if (!TERMINAL.has(t.state)) throw new Error(`Task ${t.id} is ${t.state}; cancel it first or wait.`);
@@ -837,13 +970,14 @@ export function retry(a: { runId: string; taskId: string; feedback: string; fres
   t.verifyResult = undefined;
   t.seen = false;
   t.cancelRequested = false;
+  run.owner = Deno.pid;
   save(run, true);
   pump();
   return `Task ${t.id} queued again (${fresh ? "fresh session" : `resuming session ${t.sessionId}`}).\n\n${statusText(run)}`;
 }
 
 export async function cancel(a: { runId: string; taskIds?: string[] }): Promise<string> {
-  const run = getRun(a.runId);
+  const run = await getRun(a.runId);
   const tasks = a.taskIds?.length ? a.taskIds.map((id) => getTask(run, id)) : run.tasks;
   const hit: string[] = [];
   for (const t of tasks) {
@@ -876,7 +1010,7 @@ async function ensureIntegration(run: Run): Promise<Integration> {
 }
 
 export async function integrate(a: { runId: string; taskIds?: string[]; verify?: string; continue?: boolean; abort?: boolean }): Promise<string> {
-  const run = getRun(a.runId);
+  const run = await getRun(a.runId);
   if (run.cleaned) throw new Error("This run was cleaned up.");
   const I = await ensureIntegration(run);
   const notes: string[] = [];
@@ -953,7 +1087,7 @@ export async function integrate(a: { runId: string; taskIds?: string[]; verify?:
 }
 
 export async function land(a: { runId: string; source?: string; dryRun?: boolean }): Promise<string> {
-  const run = getRun(a.runId);
+  const run = await getRun(a.runId);
   const root = run.repo;
   let from: string, to: string, label: string;
   let task: Task | undefined;
@@ -1050,7 +1184,7 @@ export async function land(a: { runId: string; source?: string; dryRun?: boolean
 }
 
 export async function cleanup(a: { runId: string; force?: boolean; deleteLogs?: boolean }): Promise<string> {
-  const run = getRun(a.runId);
+  const run = await getRun(a.runId);
   const busy = run.tasks.filter((t) => !TERMINAL.has(t.state));
   if (busy.length && !a.force) throw new Error(`Tasks still active: ${busy.map((t) => t.id).join(", ")}. Cancel them or pass force: true.`);
   const integrationLanded = !!run.landedSha && run.landedSha === run.integration?.headSha;

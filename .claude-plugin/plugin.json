@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "deepseek-harness",
-  "version": "0.1.0",
-  "description": "Deliver large, splittable coding tasks faster: run several DeepSeek-powered Claude Code workers in parallel git worktrees, then review, integrate and land their work.",
+  "version": "0.2.0",
+  "description": "Deliver large, splittable coding tasks faster: run several DeepSeek-powered coding agents in parallel git worktrees, then review, integrate and land their work.",
   "author": {
     "name": "Jiasheng Fu",
     "url": "https://github.com/FelixJiashengFu"

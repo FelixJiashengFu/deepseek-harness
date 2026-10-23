@@ -29,7 +29,7 @@ Object.assign(env, {
   ANTHROPIC_MODEL: "deepseek-flash[1m]",
   ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-flash",
   DISABLE_AUTOUPDATER: "1",
-  DSH_HOME: `${base}/home`,
+  DS_WORKERS_HOME: `${base}/home`,
 });
 const mcpConfig = `${base}/mcp.json`;
 Deno.writeTextFileSync(mcpConfig, JSON.stringify({

@@ -1,11 +1,11 @@
 // DeepSeek Harness MCP server (stdio, newline-delimited JSON-RPC, no dependencies).
 
 import * as H from "./harness.ts";
-import { DSH_HOME, ensureDir, log } from "./util.ts";
+import { STATE_HOME, ensureDir, log } from "./util.ts";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
-const INSTRUCTIONS = `DeepSeek Harness runs several DeepSeek-powered Claude Code workers in parallel, each in its own git worktree, to deliver large tasks faster. Use it when a task splits into independent parts (3+ parts of several minutes each); for small or tightly coupled work, do it yourself. Flow: dispatch -> wait -> result -> retry where needed -> integrate -> land -> cleanup. Workers cannot ask questions, so every task prompt must be complete. Their output is unverified: review diffs and run checks before landing. Code and prompts go to DeepSeek's servers. The deliver skill has the full workflow.`;
+const INSTRUCTIONS = `DeepSeek Harness runs several DeepSeek-powered coding agents in parallel (DSH headless workers, or Claude Code CLI workers when DSH is not installed), each in its own git worktree, to deliver large tasks faster. Use it when a task splits into independent parts (3+ parts of several minutes each); for small or tightly coupled work, do it yourself. Flow: dispatch -> wait -> result -> retry where needed -> integrate -> land -> cleanup. Workers cannot ask questions, so every task prompt must be complete. Their output is unverified: review diffs and run checks before landing. Code and prompts go to DeepSeek's servers. The deliver skill has the full workflow.`;
 
 const str = (description: string) => ({ type: "string", description });
 const strArr = (description: string) => ({ type: "array", items: { type: "string" }, description });
@@ -33,7 +33,7 @@ const TOOLS = [
               verify: str("Shell command (Git Bash) that must pass in the worktree, e.g. \"deno test tests/api_test.ts\". Overrides the run's verify."),
               model: str("\"flash\" (default, fast and cheap), \"pro\" (deepseek-v4-pro, stronger, about 3-4x the price) or a full model name."),
               effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"], description: "Reasoning effort; default max." },
-              maxTurns: { type: "number", description: "Optional cap on agent turns for this task." },
+              maxTurns: { type: "number", description: "Optional cap on agent turns for this task (claude engine only)." },
             },
             required: ["id", "prompt"],
           },
@@ -46,11 +46,12 @@ const TOOLS = [
         link: strArr("Git-ignored folders to share read-only from the main checkout into each worktree, e.g. [\"node_modules\"]. Faster than setup; workers must not modify them."),
         model: str("Default model for the tasks: flash (default) or pro."),
         effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"], description: "Default effort; default max." },
-        maxParallel: { type: "number", description: "Workers running at once for this run (default 6, capped by DSH_MAX_PARALLEL, default 12)." },
+        maxParallel: { type: "number", description: "Workers running at once for this run (default 6, capped by DS_WORKERS_MAX_PARALLEL, default 12)." },
         timeoutMin: { type: "number", description: "Per-attempt time limit in minutes (default 30)." },
-        maxTurns: { type: "number", description: "Default turn cap per task." },
-        allowedTools: strArr("Extra permission rules for workers, e.g. [\"Bash(docker compose *)\"]. The defaults cover file edits, git read commands and common build/test tools; anything else is denied without prompting."),
-        permissionMode: { type: "string", enum: ["acceptEdits", "bypassPermissions"], description: "acceptEdits (default): edits only inside the worktree, shell limited to the allow list. bypassPermissions: no checks at all; only when the user asked for it." },
+        maxTurns: { type: "number", description: "Default turn cap per task (claude engine only)." },
+        engine: { type: "string", enum: ["dsh", "claude"], description: "Worker engine. \"dsh\": DeepSeek Harness headless, the default when DSH is installed. \"claude\": Claude Code CLI pointed at DeepSeek. Fixed per run." },
+        allowedTools: strArr("claude engine only: extra permission rules, e.g. [\"Bash(docker compose *)\"]. The defaults cover file edits, git read commands and common build/test tools; anything else is denied without prompting."),
+        permissionMode: { type: "string", enum: ["acceptEdits", "bypassPermissions"], description: "acceptEdits (default): writes only inside the worktree (dsh: workspace-write sandbox; claude: edits in the worktree, shell limited to the allow list). bypassPermissions: no confinement (dsh: danger-full-access); only when the user asked for it." },
       },
       required: ["repo", "tasks"],
     },
@@ -184,11 +185,11 @@ async function callTool(name: string, args: any, progressToken: unknown): Promis
     case "wait":
       return await H.wait(args, progress);
     case "status":
-      return H.status(args ?? {});
+      return await H.status(args ?? {});
     case "result":
-      return H.result(args);
+      return await H.result(args);
     case "retry":
-      return H.retry(args);
+      return await H.retry(args);
     case "cancel":
       return await H.cancel(args);
     case "integrate":
@@ -238,9 +239,9 @@ async function handle(msg: any) {
 }
 
 async function main() {
-  ensureDir(DSH_HOME);
-  H.loadRuns();
-  log(`deepseek-harness ${VERSION} started (pid ${Deno.pid}, home ${DSH_HOME})`);
+  ensureDir(STATE_HOME);
+  await H.loadRuns();
+  log(`deepseek-harness ${VERSION} started (pid ${Deno.pid}, home ${STATE_HOME})`);
   for (const sig of ["SIGINT", "SIGTERM", "SIGBREAK"] as const) {
     try {
       Deno.addSignalListener(sig, () => H.shutdown().finally(() => Deno.exit(0)));
