@@ -42,7 +42,8 @@ dsh plugin --profile desktop add github:FelixJiashengFu/deepseek-harness
 ```
 
 它在 DSH 里是这样接入的：
-- `lib/index.js` 是一个很小的 cordis 宿主插件，用 DSH 自带的 `@deepseek-ai/dsh-mcp-client` 启动 harness 服务（`server/main.ts`）。工具名是 `mcp__harness__dispatch`、`mcp__harness__wait` 等。
+- `lib/index.js` 是一个很小的 cordis 宿主插件，用 DSH 自带的 `@deepseek-ai/dsh-mcp-client` 启动 harness 服务（`server/main.ts`）。工具名是 `mcp__harness__dispatch`、`mcp__harness__wait` 等。它还负责"并行"开关背后的 `/parallel` 命令、会话状态和系统提示段。
+- `lib/client.js` 是浏览器端，把"并行"按钮放进输入栏右侧的 `conversation.input.right` 座位。
 - 同时用 `@deepseek-ai/dsh-skill-filesystem` 加载 `skills/deliver`。
 - DSH 的 MCP 工具默认 60 秒超时，插件把它调到 62 分钟，所以 `wait` 可以长时间阻塞。
 - 插件配置里有 `deno`（deno 不在 PATH 上时填完整路径）和 `toolCallTimeoutMinutes` 两项。
@@ -61,7 +62,17 @@ claude plugin install deepseek-harness@deepseek-harness
 
 ## 用法
 
-直接说：“用 DeepSeek 并行把 X 做了”。在 DSH 里也可以用 `deliver` 技能，在 Claude Code 里可以用 `/deepseek-harness:deliver 把 X 做了`。`deliver` 技能会让调度方：
+### DSH：输入栏右侧的"并行"开关
+
+DSH 的输入栏右侧、模型选择器左边有一个 **并行** 按钮。点亮后，这个会话进入"并行交付模式"：之后你提的任务里，凡是能拆成三个以上互不相关部分的编码任务，智能体都会按 `deliver` 流程把它分给 DeepSeek 工人并行完成；小任务或耦合紧的任务照常自己做，并用一句话说明为什么没有拆。再点一下就关掉。
+
+- 也可以输入 `/parallel on`、`/parallel off` 或 `/parallel`（切换）。
+- 开关按会话记录，刷新页面或恢复会话后状态不变。
+- 实现方式：宿主端在会话日志里写一条 `plugin:parallel-workers/mode` 记录，并通过 `parallel-workers` 投影把状态送到界面；开关打开时，系统提示里会多一段 "Parallel delivery mode is ON…" 的说明。按钮代码在 `lib/client.js`，宿主端代码在 `lib/index.js`。
+
+### 直接说
+
+不开开关也行，直接说："用 DeepSeek 并行把 X 做了"。在 DSH 里也可以用 `deliver` 技能，在 Claude Code 里可以用 `/deepseek-harness:deliver 把 X 做了`。`deliver` 技能会让调度方：
 
 1. 先写好共享的接口、桩代码和测试（不用提交：dispatch 默认给工作区拍快照，未提交的改动也会带上）；
 2. 按**互不重叠的文件**拆成 3 到 8 个任务，每个任务带完整的提示词和 `verify` 命令；
