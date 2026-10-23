@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-harness",
+  "description": "DeepSeek Harness: parallel DeepSeek-powered Claude Code workers for faster delivery.",
+  "owner": {
+    "name": "Jiasheng Fu"
+  },
+  "plugins": [
+    {
+      "name": "deepseek-harness",
+      "source": "./",
+      "description": "Parallel DeepSeek workers in git worktrees for faster delivery of large tasks."
+    }
+  ]
+}

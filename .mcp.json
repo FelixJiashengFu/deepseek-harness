@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "harness": {
+      "command": "deno",
+      "args": ["run", "-A", "--no-config", "--quiet", "${CLAUDE_PLUGIN_ROOT}/server/main.ts"],
+      "env": {
+        "DENO_NO_UPDATE_CHECK": "1"
+      }
+    }
+  }
+}
